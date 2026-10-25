@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AssistantMessage } from "../src/types.ts";
-import { isContextOverflow, isRecoverableLength } from "../src/utils/overflow.ts";
+import { getReportedContextWindow, isContextOverflow, isRecoverableLength } from "../src/utils/overflow.ts";
 
 function createErrorMessage(errorMessage: string, provider = "ollama"): AssistantMessage {
 	return {
@@ -223,5 +223,51 @@ describe("isContextOverflow", () => {
 	it("does not treat zero-output length stops far below context as context overflow", () => {
 		const message = createLengthStopMessage({ input: 100, cacheRead: 0, output: 0 });
 		expect(isContextOverflow(message, 200000)).toBe(false);
+	});
+});
+
+describe("getReportedContextWindow", () => {
+	// Regression for #11387.
+
+	it.each([
+		// vLLM (OpenAI-compatible): the requested length comes first, the limit second.
+		// Learning the first number would adopt 120068 as the window.
+		[
+			'400: {"message":"Input length (120068) exceeds model\'s maximum context length (57344).","type":"BadRequestError","param":null,"code":400}',
+			57344,
+		],
+		["Input length (265330) exceeds model's maximum context length (262144).", 262144],
+		// LiteLLM
+		["Requested token count exceeds the model's maximum context length of 131072 tokens", 131072],
+		// OpenRouter
+		["This endpoint's maximum context length is 57344 tokens. However, you requested about 60000 tokens", 57344],
+		// xAI
+		["This model's maximum prompt length is 131072 but the request contains 537812 tokens", 131072],
+		// Together AI
+		["The input (300000 tokens) is longer than the model's context length (262144 tokens).", 262144],
+		// Google
+		["The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)", 1048575],
+		// Mistral
+		["Prompt contains 40000 tokens, which is too large for model with 32768 maximum context length", 32768],
+		// DS4
+		["Prompt has 40000 tokens, but the configured context size is 32768 tokens", 32768],
+		// Anthropic
+		["prompt is too long: 213462 tokens > 200000 maximum", 200000],
+		// Thousands separators
+		["maximum context length is 1,048,576 tokens", 1048576],
+	])("extracts the reported limit: %s", (errorMessage, expected) => {
+		expect(getReportedContextWindow(errorMessage)).toBe(expected);
+	});
+
+	it.each([
+		"prompt is too long", // Detectable overflow, but no numeric limit is reported.
+		"400 Bad Request: invalid tool call arguments",
+		"rate limit exceeded: maximum 100 requests per minute", // Non-overflow exclusion wins.
+	])("returns undefined when no limit is reported: %s", (errorMessage) => {
+		expect(getReportedContextWindow(errorMessage)).toBeUndefined();
+	});
+
+	it("returns undefined for a missing error message", () => {
+		expect(getReportedContextWindow(undefined)).toBeUndefined();
 	});
 });

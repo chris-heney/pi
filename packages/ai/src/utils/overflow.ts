@@ -69,6 +69,51 @@ const OVERFLOW_PATTERNS = [
 const CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i;
 
 /**
+ * Patterns that extract the provider-reported context window (in tokens) from an
+ * overflow error message. Each pattern captures the limit, never the request size:
+ * several formats put the requested length first (e.g. vLLM "Input length (120068)
+ * exceeds model's maximum context length (57344)."), so matching the first number
+ * in the message would learn the wrong value.
+ */
+const REPORTED_CONTEXT_WINDOW_PATTERNS = [
+	/maximum context length \(([\d,]+)\)/i, // vLLM / OpenAI-compatible: "exceeds model's maximum context length (57344)."
+	/maximum context length of ([\d,]+) tokens?/i, // LiteLLM: "exceeds the model's maximum context length of 131072 tokens"
+	/maximum context length is ([\d,]+) tokens?/i, // OpenRouter: "maximum context length is 57344 tokens"
+	/with ([\d,]+) maximum context length/i, // Mistral: "too large for model with 32768 maximum context length"
+	/maximum prompt length is ([\d,]+)/i, // xAI: "This model's maximum prompt length is 131072"
+	/model'?s context length \(([\d,]+) tokens?\)/i, // Together AI: "longer than the model's context length (262144 tokens)"
+	/maximum number of tokens allowed \(([\d,]+)\)/i, // Google: "exceeds the maximum number of tokens allowed (1048575)"
+	/configured context size is ([\d,]+) tokens?/i, // DS4: "the configured context size is 32768 tokens"
+	/prompt is too long: [\d,]+ tokens? > ([\d,]+) maximum/i, // Anthropic: "prompt is too long: 213462 tokens > 200000 maximum"
+];
+
+/**
+ * Extract the context window a provider reported in an overflow error message.
+ *
+ * Custom providers declare `contextWindow` in models.json, and nothing validates
+ * that declaration against the server. When it is too large (e.g. 1000000 declared
+ * for a vLLM engine served with `--max-model-len 57344`), threshold compaction
+ * never fires and every long session runs into a hard 400 from the server. The
+ * error message is the first place the real limit appears, so callers can learn
+ * it from there and compact against the smaller of the two values.
+ *
+ * Returns undefined when the message carries no recognizable limit, and for
+ * messages that match the non-overflow exclusions (e.g. rate limiting).
+ */
+export function getReportedContextWindow(errorMessage: string | undefined): number | undefined {
+	if (!errorMessage) return undefined;
+	if (NON_OVERFLOW_PATTERNS.some((p) => p.test(errorMessage))) return undefined;
+	for (const pattern of REPORTED_CONTEXT_WINDOW_PATTERNS) {
+		const match = pattern.exec(errorMessage);
+		if (match) {
+			const value = Number(match[1].replace(/,/g, ""));
+			if (Number.isSafeInteger(value) && value > 0) return value;
+		}
+	}
+	return undefined;
+}
+
+/**
  * Patterns that indicate non-overflow errors (e.g. rate limiting, server errors).
  * Error messages matching any of these are excluded from overflow detection
  * even if they also match an OVERFLOW_PATTERN.

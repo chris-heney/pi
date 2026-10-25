@@ -828,6 +828,40 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
+	it("applies the provider-reported context window to later threshold checks after an overflow error", async () => {
+		// Regression for #11387. A custom provider can declare a window far above the served limit (here
+		// 1000000 declared vs 57344 served by vLLM). The first overflow error reports
+		// the real limit; later turns must compact against it instead of the
+		// declaration, or every cycle re-runs into the same 400.
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 1_000_000, maxTokens: 100 }],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		const overflowMessage = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage:
+				'400: {"message":"Input length (60061) exceeds model\'s maximum context length (57344).","type":"BadRequestError","param":null,"code":400}',
+			timestamp: Date.now(),
+		});
+		await sessionInternals._checkCompaction(overflowMessage);
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("overflow", true);
+		expect(harness.session.getContextUsage()?.contextWindow).toBe(57344);
+		runAutoCompactionSpy.mockClear();
+
+		// 50000 tokens is below the declared threshold (1000000 - 16384) but above
+		// the reported one (57344 - 16384), so only the reported window compacts here.
+		const successfulMessage = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 50_000,
+			timestamp: Date.now() + 1,
+		});
+		await sessionInternals._checkCompaction(successfulMessage);
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+	});
+
 	it("compacts successful overflow responses without retrying", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },

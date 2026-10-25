@@ -10,6 +10,7 @@
 
 - Added optional `openBrowserOnConfirm` and `copyCodeOnConfirm` to `device_code` auth events and `OAuthDeviceCodeInfo`. Both default to `true`; set them to `false` to stop clients from offering to open the verification page or copy the code ([#9282](https://github.com/earendil-works/pi/issues/9282), [#9301](https://github.com/earendil-works/pi/pull/9301))
 - Added `StreamingJsonParser`, an incremental, tolerant parser for JSON text that arrives in pieces (each piece is read once; snapshots of the partial value never change once returned), and `ToolCallArgumentsStream`, which every provider now uses for streamed tool-call arguments; its `append()` also returns the changes each piece made (`JsonChange`: a value set at a path, or text appended to a string), for writers that keep their own copy ([#9265](https://github.com/earendil-works/pi/issues/9265))
+- Added `getReportedContextWindow()`, which extracts the context window a provider reports in an overflow error message (vLLM, LiteLLM, OpenRouter, xAI, Together, Google, Mistral, DS4, Anthropic formats), for callers whose declared window may exceed the served limit ([#11387](https://github.com/earendil-works/pi/issues/11387))
 
 ### Changed
 

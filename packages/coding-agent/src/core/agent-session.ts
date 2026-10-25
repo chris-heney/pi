@@ -46,6 +46,7 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	getReportedContextWindow,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	isRecoverableLength,
@@ -404,6 +405,14 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	/**
+	 * Smallest context window the provider has reported in an overflow error for the
+	 * current model. A declared `contextWindow` (models.json) can exceed the served
+	 * limit (e.g. vLLM `--max-model-len`); until the first 400 the declaration is all
+	 * the session has, so the reported value is learned from that error and applied
+	 * to later compaction checks. Reset when the model changes.
+	 */
+	private _providerReportedContextWindow: number | undefined = undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -763,12 +772,18 @@ export class AgentSession {
 		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
 	}
 
+	/** The declared window of a model, narrowed by a smaller provider-reported limit when one is known. */
+	private _effectiveContextWindow(declaredContextWindow: number): number {
+		const reported = this._providerReportedContextWindow;
+		return reported !== undefined && reported < declaredContextWindow ? reported : declaredContextWindow;
+	}
+
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
 	private _exceedsCompactionThreshold(model: Model<any>, projection: SessionProjection): boolean {
 		if (model.contextWindow <= 0) return false;
 		return shouldCompact(
 			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
-			model.contextWindow,
+			this._effectiveContextWindow(model.contextWindow),
 			this.settingsManager.getCompactionSettings(this.model),
 		);
 	}
@@ -2544,6 +2559,9 @@ export class AgentSession {
 		}
 
 		const previousModel = this.model;
+		if (!previousModel || !modelsAreEqual(previousModel, model)) {
+			this._providerReportedContextWindow = undefined;
+		}
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
@@ -3022,7 +3040,7 @@ export class AgentSession {
 		// physical model that produced the message supplies the limits.
 		const messageModel = this._modelForMessage(assistantMessage);
 		const sameModel = messageModel !== undefined;
-		const contextWindow = (messageModel ?? this.model)?.contextWindow ?? 0;
+		const declaredContextWindow = (messageModel ?? this.model)?.contextWindow ?? 0;
 
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
@@ -3061,6 +3079,20 @@ export class AgentSession {
 				latestAssistantEdit?.replacement !== null);
 		const assistantUsageMatchesProjection = assistantIsProjected && !hasPostAssistantContextEdit;
 		const explicitOverflow = assistantMessage.stopReason === "error" && isContextOverflow(assistantMessage);
+		// Learn the served limit from the provider's overflow error. A declared window
+		// larger than the real one (custom provider, server-side `--max-model-len`)
+		// otherwise re-runs into the same 400 after every emergency compaction,
+		// because threshold checks keep trusting the declaration.
+		if (sameModel && explicitOverflow) {
+			const reported = getReportedContextWindow(assistantMessage.errorMessage);
+			if (
+				reported !== undefined &&
+				(this._providerReportedContextWindow === undefined || reported < this._providerReportedContextWindow)
+			) {
+				this._providerReportedContextWindow = reported;
+			}
+		}
+		const contextWindow = this._effectiveContextWindow(declaredContextWindow);
 		const contextOverflow =
 			sameModel &&
 			((explicitOverflow && assistantRetainedForExplicitRecovery) ||
@@ -4298,7 +4330,7 @@ export class AgentSession {
 		const model = this._limitsModel();
 		if (!model) return undefined;
 
-		const contextWindow = model.contextWindow ?? 0;
+		const contextWindow = this._effectiveContextWindow(model.contextWindow ?? 0);
 		if (contextWindow <= 0) return undefined;
 
 		// After compaction, the last assistant usage reflects pre-compaction context size.
